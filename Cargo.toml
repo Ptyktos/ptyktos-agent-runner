@@ -1,0 +1,47 @@
+[package]
+name = "ptyktos-agent-runner"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The Ptyktos substrate as a saga runner — implements the RunnerJob/RunnerEvent contract for the 5 lifecycle phases (plan/apply/verify/compensate/destroy). Plugs into the Tasmanian-Cloud/saga `runner` crate as a 6th binary alongside tofu-runner/ansible-runner/helm-runner/proxmox-runner/talm-runner."
+
+[workspace]
+
+[lib]
+name = "ptyktos_agent_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ptyktos-agent-runner"
+path = "src/bin/ptyktos_agent_runner.rs"
+
+# ─── runtime deps (always built) ─────────────────────────────────────
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# ─── to swap the local contract types for the canonical hosting-core
+#     types, change the `use runner_contract::*;` line in `src/contract.rs`
+#     to `use hosting_core::task::*;` and add to your workspace:
+#
+#     [dependencies.hosting-core]
+#     path = "../hosting-runtime/crates/hosting-core"
+#
+#     The contract types in `src/contract.rs` are byte-equal to
+#     `hosting_core::task::{RunnerJob, RunnerEvent, RunnerOutcome,
+#     RunnerPhase, RunnerEventKind, FailureCategory, AuthzContext,
+#     RunnerDestination, RunnerRecipeRef, RunnerRequiresBinding,
+#     RunnerPreviousAttempt}` so the swap is one line.
