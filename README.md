@@ -29,9 +29,20 @@ the canonical fixtures here.
 
 | Variable | Meaning |
 |---|---|
-| `TAS_RUNNER_IDEMPOTENCY_KEY` | Required. The saga's key for this step (`<saga_id>:<phase>:<ordinal>`). Checkpoints are keyed by it, not by `job_id`, because each attempt has a new `job_id`. |
-| `TAS_RUNNER_CHECKPOINT_DIR` | Required. Directory for checkpoint files (one `<hex key>.json` per key). |
+| `TAS_RUNNER_IDEMPOTENCY_KEY` | Required. `<lifecycle>:<phase>:<ordinal>`, e.g. `saga-42:apply:1`. The lifecycle id (no `:` inside) names the checkpoint, so all phases of one saga share it. The phase segment must match the job's phase, or the runner exits 2. The full key identifies one attempt of one phase. |
+| `TAS_RUNNER_CHECKPOINT_DIR` | Required. Directory for checkpoint files: one `<hex lifecycle>.json` per saga, plus a `.lock` beside each. |
 | `PTYKTOS_AGENT_RUNNER_SUBSTRATE` | Selects a substrate. Only `local-test`, and only in a build with `--features test-substrate`. Anything else (or unset) exits 2. |
+
+## Checkpoint semantics
+
+- The checkpoint is held under an exclusive file lock from load to the end
+  of the run, so two overlapping runners on one saga serialise.
+- Every write goes to a unique temp file (`create_new`, pid, counter, clock),
+  is fsynced, then renamed over the checkpoint.
+- A phase that completed under a given full key records that key. The same
+  key again replays its outcome. A different ordinal re-runs the phase
+  idempotently: apply does not mount or run the agent again if it already
+  recorded its output.
 
 ## The phases
 

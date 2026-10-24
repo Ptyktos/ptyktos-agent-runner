@@ -167,7 +167,9 @@ impl AgentWorkspace for LocalTestSubstrate {
     }
     async fn snapshot(&self, workspace_id: &str) -> SubstrateResult<String> {
         if self.flag("snapshot").as_deref() == Some("fail") {
-            return Err(SubstrateError::Transient("snapshot unavailable (test flag)".into()));
+            return Err(SubstrateError::Transient(
+                "snapshot unavailable (test flag)".into(),
+            ));
         }
         self.log(&format!("snapshot {workspace_id}"))?;
         Ok(format!("snap-{workspace_id}"))

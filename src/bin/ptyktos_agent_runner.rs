@@ -4,7 +4,8 @@
 //! 3 policy, 64 unreadable job, 143 SIGTERM).
 //!
 //! Environment:
-//! - `TAS_RUNNER_IDEMPOTENCY_KEY` (required): the saga's key for this step.
+//! - `TAS_RUNNER_IDEMPOTENCY_KEY` (required): `<lifecycle>:<phase>:<ordinal>`.
+//!   The lifecycle names the checkpoint, shared by all phases of one saga.
 //! - `TAS_RUNNER_CHECKPOINT_DIR` (required): where state is checkpointed.
 //! - a substrate (see `ptyktos_agent_runner::substrate_from_env`). None is
 //!   configured in a default build, so the runner exits 2 with a clear event.
@@ -16,8 +17,8 @@ use ptyktos_agent_runner::contract::{
     FailureCategory, RunnerEventKind, RunnerJob, RunnerOutcome, RunnerPhase,
 };
 use ptyktos_agent_runner::{
-    checkpoint_path, run, substrate_from_env, RunnerState, CHECKPOINT_DIR_ENV, IDEMPOTENCY_KEY_ENV,
-    SUBSTRATE_ENV,
+    checkpoint_path, parse_idempotency_key, run_attempt, substrate_from_env, RunnerState,
+    CHECKPOINT_DIR_ENV, IDEMPOTENCY_KEY_ENV, SUBSTRATE_ENV,
 };
 
 #[tokio::main]
@@ -59,7 +60,18 @@ async fn main() -> ExitCode {
         );
     };
 
-    let path = checkpoint_path(Path::new(&dir), &key);
+    let lifecycle = match parse_idempotency_key(&key) {
+        Ok((lifecycle, _, _)) => lifecycle,
+        Err(reason) => {
+            return finish(
+                &emitter,
+                RunnerOutcome::aborted(reason, FailureCategory::Precondition),
+            )
+        }
+    };
+    // One checkpoint per saga lifecycle: every phase of the saga opens the same
+    // file, and the lock inside `open` serialises concurrent attempts.
+    let path = checkpoint_path(Path::new(&dir), lifecycle);
     let mut state = match RunnerState::open(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -73,7 +85,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    match race_sigterm(run(&job, &substrate, &mut state)).await {
+    match race_sigterm(run_attempt(&job, &substrate, &mut state, &key)).await {
         RaceOutcome::Completed(outcome) => finish(&emitter, outcome),
         RaceOutcome::SigTerm => handle_sigterm(&job),
     }
