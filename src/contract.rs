@@ -1,29 +1,22 @@
-//! The runner contract — the wire shape that `saga-orchestrator` and
-//! `workflow-worker` consume. The types here are byte-equal to
-//! `hosting_core::task::{RunnerJob, RunnerEvent, RunnerOutcome,
-//! RunnerPhase, RunnerEventKind, FailureCategory, AuthzContext,
-//! RunnerDestination, RunnerRecipeRef, RunnerRequiresBinding,
-//! RunnerPreviousAttempt}` so the swap to the real hosting-core is one
-//! `use` line (see `Cargo.toml`).
+//! The runner contract: the wire shape that `saga-orchestrator` and
+//! `workflow-worker` consume. These types are a local copy of the
+//! `hosting_core::task` runner types (`RunnerJob`, `RunnerEvent`,
+//! `RunnerOutcome`, `RunnerPhase`, `RunnerEventKind`, `FailureCategory`,
+//! ...). This crate must not depend on `hosting-core`: that crate is
+//! AGPL and the runner is distributed as a separate MIT/Apache binary.
 //!
-//! Why duplicate? Two reasons.
-//!
-//! 1. **The dev cycle**: a standalone crate that builds without the
-//!    full hosting-runtime workspace compiles in seconds, not minutes.
-//!    The contract test suite runs in the same crate; the integration
-//!    with the real `hosting-core` is the only thing that needs the
-//!    full build.
-//!
-//! 2. **The schema**: this file is the canonical wire shape. When the
-//!    contract evolves (e.g. a new field on `RunnerJob`), the change
-//!    is reviewable in one place. The hosting-core migration is a
-//!    mechanical `diff` against this file.
+//! The copy is kept in one file so a change to the canonical schema is a
+//! one-file diff. Byte-equality with the canonical fixtures is NOT checked
+//! here (the hosting-runtime workspace is not part of this repository).
+
+// The variant and field names here are the wire schema; each maps to a
+// documented row in README.md, so they carry no separate doc comments.
+#![allow(missing_docs)]
 
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 // ─── RunnerPhase ──────────────────────────────────────────────────────
 
@@ -227,25 +220,47 @@ pub struct RunnerEvent {
 /// outcome to a (kind, data) terminal event + an exit code.
 #[derive(Clone, Debug)]
 pub enum RunnerOutcome {
-    Succeeded,
-    Failed { reason: String, category: FailureCategory },
-    Aborted { reason: String, category: FailureCategory },
-    NeedsCompensation { reason: String, category: FailureCategory },
+    /// The phase completed. `outputs` is the phase's result payload
+    /// (e.g. the apply branch / PR), emitted on the terminal event.
+    Succeeded { outputs: serde_json::Value },
+    Failed {
+        reason: String,
+        category: FailureCategory,
+    },
+    Aborted {
+        reason: String,
+        category: FailureCategory,
+    },
+    NeedsCompensation {
+        reason: String,
+        category: FailureCategory,
+    },
 }
 
 impl RunnerOutcome {
     pub fn succeeded() -> Self {
-        Self::Succeeded
+        Self::Succeeded {
+            outputs: serde_json::json!({}),
+        }
+    }
+    pub fn succeeded_with(outputs: serde_json::Value) -> Self {
+        Self::Succeeded { outputs }
     }
     pub fn failed(reason: impl Into<String>, category: FailureCategory) -> Self {
-        Self::Failed { reason: reason.into(), category }
+        Self::Failed {
+            reason: reason.into(),
+            category,
+        }
     }
     pub fn aborted(reason: impl Into<String>, category: FailureCategory) -> Self {
-        Self::Aborted { reason: reason.into(), category }
+        Self::Aborted {
+            reason: reason.into(),
+            category,
+        }
     }
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::Succeeded => 0,
+            Self::Succeeded { .. } => 0,
             Self::Failed { category, .. } => match category {
                 FailureCategory::Transient
                 | FailureCategory::CorruptState
@@ -265,7 +280,7 @@ impl RunnerOutcome {
     /// the `succeeded` / `failed` / `aborted` event.
     pub fn terminal_event_data(&self) -> (RunnerEventKind, serde_json::Value) {
         match self {
-            Self::Succeeded => (RunnerEventKind::Succeeded, serde_json::json!({})),
+            Self::Succeeded { outputs } => (RunnerEventKind::Succeeded, outputs.clone()),
             Self::Failed { reason, category } => (
                 RunnerEventKind::Failed,
                 serde_json::json!({ "reason": reason, "category": category.as_str() }),
@@ -282,26 +297,8 @@ impl RunnerOutcome {
     }
 }
 
-// ─── conversion to the canonical hosting-core types (one swap) ──────
-//
-// In a real workspace, delete this file and `use hosting_core::task::*;`
-// instead. The shapes are byte-equal (verified by tests/contract.rs
-// in the saga repo's runner-contract-tests crate).
-
 impl From<RunnerOutcome> for (RunnerEventKind, serde_json::Value) {
     fn from(o: RunnerOutcome) -> Self {
         o.terminal_event_data()
     }
-}
-
-// ─── scaffolding for the schema-version constant ─────────────────────
-
-#[allow(dead_code)]
-fn _scaffold() {
-    // Forces the compiler to keep `Uuid` in the dependency tree; the
-    // schema has a `Uuid` for `ProviderAccount.id` (see
-    // `hosting-core::provider::ProviderAccount`) but `RunnerJob` does
-    // not. This keeps the import path consistent with the
-    // `hosting-core` shape so the `use` swap is one line.
-    let _ = Uuid::nil();
 }

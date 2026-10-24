@@ -26,22 +26,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-parking_lot = "0.12"
+
+# Test doubles (`testing` module). Off by default: a production build has no
+# substrate, so the binary exits 2. Enabled for tests through the dev-dependency
+# below.
+[features]
+default = []
+test-substrate = []
 
 [dev-dependencies]
+ptyktos-agent-runner = { path = ".", features = ["test-substrate"] }
 tempfile = "3"
-serde_json = "1"
 tokio = { version = "1", features = ["full", "test-util"] }
-
-# ─── to swap the local contract types for the canonical hosting-core
-#     types, change the `use runner_contract::*;` line in `src/contract.rs`
-#     to `use hosting_core::task::*;` and add to your workspace:
-#
-#     [dependencies.hosting-core]
-#     path = "../hosting-runtime/crates/hosting-core"
-#
-#     The contract types in `src/contract.rs` are byte-equal to
-#     `hosting_core::task::{RunnerJob, RunnerEvent, RunnerOutcome,
-#     RunnerPhase, RunnerEventKind, FailureCategory, AuthzContext,
-#     RunnerDestination, RunnerRecipeRef, RunnerRequiresBinding,
-#     RunnerPreviousAttempt}` so the swap is one line.

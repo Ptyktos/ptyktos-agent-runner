@@ -10,13 +10,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ptyktos_agent_runner::contract::{
-    FailureCategory, RunnerDestination, RunnerEventKind, RunnerJob, RunnerOutcome, RunnerPhase,
-    RunnerRecipeRef,
+    FailureCategory, RunnerDestination, RunnerJob, RunnerOutcome, RunnerPhase, RunnerRecipeRef,
 };
 use ptyktos_agent_runner::substrate::{
-    AgentOutput, AgentTask, GateDecision, GovernanceGate, PtyktosSubstrate, ReviewSurface,
-    ReviewVerdict, SubstrateError, SubstrateResult, TraceSubstrate, AgentWorkspace, AgentRuntime,
+    AgentOutput, AgentRuntime, AgentTask, GateDecision, GovernanceGate, PtyktosSubstrate,
+    ReviewVerdict, SubstrateError, SubstrateResult,
 };
+use ptyktos_agent_runner::testing::{noop, NoopSubstrate};
 use ptyktos_agent_runner::{run, RenderedTemplate, RunnerState};
 use serde_json::json;
 
@@ -73,17 +73,14 @@ fn rendered_template_rejects_wrong_shape_with_precondition() {
         version: "0.1.0".to_string(),
         rendered_template: bad,
     });
-    assert!(matches!(
-        r,
-        Err(SubstrateError::Precondition(_))
-    ));
+    assert!(matches!(r, Err(SubstrateError::Precondition(_))));
 }
 
 // ─── no-op substrate runs the 5 phases end-to-end ───────────────────
 
 #[tokio::test]
 async fn noop_substrate_runs_all_5_phases() {
-    let substrate = PtyktosSubstrate::noop();
+    let substrate = noop();
     let mut state = RunnerState::default();
 
     for phase in [
@@ -107,7 +104,7 @@ async fn noop_substrate_runs_all_5_phases() {
 
 #[tokio::test]
 async fn apply_phase_populates_state() {
-    let substrate = PtyktosSubstrate::noop();
+    let substrate = noop();
     let mut state = RunnerState::default();
 
     // plan first (does not mutate state)
@@ -127,7 +124,7 @@ async fn apply_phase_populates_state() {
 
 #[tokio::test]
 async fn verify_without_apply_is_precondition() {
-    let substrate = PtyktosSubstrate::noop();
+    let substrate = noop();
     let mut state = RunnerState::default();
 
     let job = make_job(good_template(), RunnerPhase::Verify);
@@ -139,7 +136,7 @@ async fn verify_without_apply_is_precondition() {
 
 #[tokio::test]
 async fn missing_recipe_aborts_with_precondition() {
-    let substrate = PtyktosSubstrate::noop();
+    let substrate = noop();
     let mut state = RunnerState::default();
     let mut job = make_job(good_template(), RunnerPhase::Plan);
     job.recipe = None;
@@ -169,13 +166,9 @@ impl GovernanceGate for DenyingGate {
 #[tokio::test]
 async fn gate_denial_fails_verify() {
     // Build a substrate where the gate denies.
-    let substrate = PtyktosSubstrate {
-        workspace: Arc::new(ptyktos_agent_runner::substrate::NoopSubstrate),
-        runtime: Arc::new(ptyktos_agent_runner::substrate::NoopSubstrate),
-        trace: Arc::new(ptyktos_agent_runner::substrate::NoopSubstrate),
-        review: Arc::new(ptyktos_agent_runner::substrate::NoopSubstrate),
-        gate: Arc::new(DenyingGate),
-    };
+    let n = Arc::new(NoopSubstrate);
+    let substrate =
+        PtyktosSubstrate::new(n.clone(), n.clone(), n.clone(), n, Arc::new(DenyingGate));
     let mut state = RunnerState::default();
 
     // First run apply to populate state
@@ -185,8 +178,19 @@ async fn gate_denial_fails_verify() {
     // Now verify — the gate should deny
     let verify_job = make_job(good_template(), RunnerPhase::Verify);
     let outcome = run(&verify_job, &substrate, &mut state).await;
-    // Policy = exit 3 per the contract (RunnerOutcome::aborted w/ Policy)
-    assert_eq!(outcome.exit_code(), 3);
+    // A gate denial after apply means the saga must compensate: a
+    // NeedsCompensation outcome (exit 1), not a plain policy abort.
+    assert!(
+        matches!(
+            outcome,
+            ptyktos_agent_runner::contract::RunnerOutcome::NeedsCompensation {
+                category: FailureCategory::Policy,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.exit_code(), 1);
 }
 
 // ─── a custom substrate that errors at the agent runtime ─────────────
@@ -207,14 +211,14 @@ impl AgentRuntime for FailingRuntime {
 
 #[tokio::test]
 async fn runtime_error_fails_apply() {
-    let noop = Arc::new(ptyktos_agent_runner::substrate::NoopSubstrate);
-    let substrate = PtyktosSubstrate {
-        workspace: noop.clone(),
-        runtime: Arc::new(FailingRuntime),
-        trace: noop.clone(),
-        review: noop.clone(),
-        gate: noop,
-    };
+    let noop = Arc::new(NoopSubstrate);
+    let substrate = PtyktosSubstrate::new(
+        noop.clone(),
+        Arc::new(FailingRuntime),
+        noop.clone(),
+        noop.clone(),
+        noop,
+    );
     let mut state = RunnerState::default();
     let job = make_job(good_template(), RunnerPhase::Apply);
     let outcome = run(&job, &substrate, &mut state).await;

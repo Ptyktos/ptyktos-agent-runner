@@ -1,52 +1,89 @@
-//! `ptyktos-agent-runner` CLI entrypoint per `docs/runner-contract.md`.
+//! `ptyktos-agent-runner` CLI. Reads one `RunnerJob` from stdin, runs the
+//! phase, writes line-delimited `RunnerEvent`s to stdout, and exits with the
+//! contract code (0 succeeded, 1 transient / internal, 2 precondition,
+//! 3 policy, 64 unreadable job, 143 SIGTERM).
 //!
-//! Reads one [`hosting_core::task::RunnerJob`] from stdin, runs the phase,
-//! emits line-delimited [`hosting_core::task::RunnerEvent`]s on stdout, and
-//! exits with the contract-defined code. See the crate root doc for the
-//! 5-phase lifecycle (plan / apply / verify / compensate / destroy).
-//!
-//! The shared stdin/stdout/SIGTERM/exit-code skeleton mirrors the existing
-//! `tofu-runner` / `ansible-runner` / `helm-runner` / `proxmux-runner` /
-//! `talm-runner` binaries; the agent-specific phase logic lives in
-//! `ptyktos_agent_runner::run`.
+//! Environment:
+//! - `TAS_RUNNER_IDEMPOTENCY_KEY` (required): the saga's key for this step.
+//! - `TAS_RUNNER_CHECKPOINT_DIR` (required): where state is checkpointed.
+//! - a substrate (see `ptyktos_agent_runner::substrate_from_env`). None is
+//!   configured in a default build, so the runner exits 2 with a clear event.
 
+use std::path::Path;
 use std::process::ExitCode;
 
-use ptyktos_agent_runner::contract::RunnerJob;
-use ptyktos_agent_runner::{run, PtyktosSubstrate, RunnerState};
+use ptyktos_agent_runner::contract::{
+    FailureCategory, RunnerEventKind, RunnerJob, RunnerOutcome, RunnerPhase,
+};
+use ptyktos_agent_runner::{
+    checkpoint_path, run, substrate_from_env, RunnerState, CHECKPOINT_DIR_ENV, IDEMPOTENCY_KEY_ENV,
+    SUBSTRATE_ENV,
+};
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let Some(job) = read_job_from_stdin() else {
         return ExitCode::from(64);
     };
-
     let emitter = EventEmitter::new(&job);
-    let substrate = PtyktosSubstrate::noop();
-    let mut state = RunnerState::default();
 
-    // The Ptyktos substrate is a no-op when no substrate adapter is
-    // wired in. The saga-orchestrator runs the binary on the agent
-    // host; production builds replace PtyktosSubstrate::noop() with
-    // PtyktosSubstrate::ptyktos() (the real adapter set).
+    let Some(key) = non_empty_env(IDEMPOTENCY_KEY_ENV) else {
+        return finish(
+            &emitter,
+            RunnerOutcome::aborted(
+                format!(
+                    "{IDEMPOTENCY_KEY_ENV} is not set; the runner cannot checkpoint without it"
+                ),
+                FailureCategory::Precondition,
+            ),
+        );
+    };
+    let Some(dir) = non_empty_env(CHECKPOINT_DIR_ENV) else {
+        return finish(
+            &emitter,
+            RunnerOutcome::aborted(
+                format!("{CHECKPOINT_DIR_ENV} is not set; the runner cannot checkpoint"),
+                FailureCategory::Precondition,
+            ),
+        );
+    };
+    let Some(substrate) = substrate_from_env() else {
+        return finish(
+            &emitter,
+            RunnerOutcome::aborted(
+                format!(
+                    "no substrate is configured for this runner ({SUBSTRATE_ENV} is unset or not recognised); refusing to run"
+                ),
+                FailureCategory::Precondition,
+            ),
+        );
+    };
+
+    let path = checkpoint_path(Path::new(&dir), &key);
+    let mut state = match RunnerState::open(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return finish(
+                &emitter,
+                RunnerOutcome::failed(
+                    format!("ptyktos-agent-runner: cannot load checkpoint: {e}"),
+                    e.category(),
+                ),
+            )
+        }
+    };
+
     match race_sigterm(run(&job, &substrate, &mut state)).await {
         RaceOutcome::Completed(outcome) => finish(&emitter, outcome),
         RaceOutcome::SigTerm => handle_sigterm(&job),
     }
 }
 
-// ─── the runner skeleton (mirrors the `runner` crate's lib.rs) ──────
-//
-// These helpers are the minimum needed to match the runner contract
-// (`docs/runner-contract.md`): one JSON job from stdin, line-delimited
-// JSON events on stdout, free-form logs on stderr, exit code 0/2/3/64
-// per the contract's table. They're duplicated here (rather than
-// imported from the `runner` crate) to keep `ptyktos-agent-runner`
-// self-contained: a one-crate build that doesn't require the full
-// saga/hosting-runtime to compile.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
 
-/// Read the [`RunnerJob`] from stdin. Returns `None` on parse error
-/// (the caller exits with 64 per the contract).
+/// Read the job from stdin. `None` means it did not parse (exit 64).
 fn read_job_from_stdin() -> Option<RunnerJob> {
     use std::io::Read;
     let mut s = String::new();
@@ -54,11 +91,10 @@ fn read_job_from_stdin() -> Option<RunnerJob> {
     serde_json::from_str(&s).ok()
 }
 
-/// One event per `kind` + data payload, written as one line of JSON
-/// to stdout.
+/// Writes one JSON event per line on stdout. Logs go to stderr.
 struct EventEmitter<'a> {
     job_id: &'a str,
-    phase: hosting_core::task::RunnerPhase,
+    phase: RunnerPhase,
     seq: std::sync::atomic::AtomicU64,
 }
 
@@ -71,14 +107,8 @@ impl<'a> EventEmitter<'a> {
         }
     }
 
-    fn emit(
-        &self,
-        kind: ptyktos_agent_runner::contract::RunnerEventKind,
-        data: serde_json::Value,
-    ) {
-        let seq = self
-            .seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    fn emit(&self, kind: RunnerEventKind, data: serde_json::Value) {
+        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let event = ptyktos_agent_runner::contract::RunnerEvent {
             version: "1".to_string(),
             ts: chrono::Utc::now(),
@@ -89,7 +119,6 @@ impl<'a> EventEmitter<'a> {
             decision_id: None,
             data,
         };
-        // Stdout is events only; logs go to stderr. One line per event.
         if let Ok(s) = serde_json::to_string(&event) {
             println!("{s}");
         }
@@ -97,16 +126,15 @@ impl<'a> EventEmitter<'a> {
 }
 
 enum RaceOutcome {
-    Completed(ptyktos_agent_runner::RunnerOutcome),
+    Completed(RunnerOutcome),
     SigTerm,
 }
 
-/// `tokio::select!` over the runner future and a SIGTERM signal. The
-/// saga-orchestrator sends SIGTERM at the lease boundary; on receipt
-/// we transition to the `compensate` phase via the saga's next call.
+/// Race the phase against SIGTERM. On SIGTERM the phase future is dropped;
+/// whatever it had checkpointed stays on disk for the next attempt.
 async fn race_sigterm<F>(f: F) -> RaceOutcome
 where
-    F: std::future::Future<Output = ptyktos_agent_runner::RunnerOutcome>,
+    F: std::future::Future<Output = RunnerOutcome>,
 {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = match signal(SignalKind::terminate()) {
@@ -119,23 +147,17 @@ where
     }
 }
 
-fn finish(
-    emitter: &EventEmitter<'_>,
-    outcome: ptyktos_agent_runner::RunnerOutcome,
-) -> ExitCode {
+fn finish(emitter: &EventEmitter<'_>, outcome: RunnerOutcome) -> ExitCode {
     let (kind, data) = outcome.terminal_event_data();
     emitter.emit(kind, data);
     ExitCode::from(outcome.exit_code() as u8)
 }
 
 fn handle_sigterm(job: &RunnerJob) -> ExitCode {
-    // Per the contract, exit 143 on SIGTERM and emit a NeedsCompensation
-    // event so the saga-orchestrator knows to retry with the
-    // compensate phase.
     let emitter = EventEmitter::new(job);
     emitter.emit(
-        ptyktos_agent_runner::contract::RunnerEventKind::NeedsCompensation,
-        serde_json::json!({ "reason": "SIGTERM during phase" }),
+        RunnerEventKind::NeedsCompensation,
+        serde_json::json!({ "reason": "SIGTERM during phase", "category": FailureCategory::RestartDuringApply.as_str() }),
     );
     ExitCode::from(143)
 }
