@@ -7,7 +7,8 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use ptyktos_agent_runner::contract::{
     FailureCategory, RunnerDestination, RunnerJob, RunnerPhase, RunnerRecipeRef,
@@ -92,8 +93,8 @@ impl Ran {
     }
 }
 
-/// Start the runner binary with `envs` set and `job` on stdin.
-fn run_runner(job: &RunnerJob, envs: &[(&str, &str)]) -> Ran {
+/// Start the runner binary with `envs` set and `job` on stdin (then closed).
+fn spawn_runner(job: &RunnerJob, envs: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ptyktos-agent-runner"));
     cmd.env_clear()
         .stdin(Stdio::piped())
@@ -109,7 +110,12 @@ fn run_runner(job: &RunnerJob, envs: &[(&str, &str)]) -> Ran {
         .unwrap()
         .write_all(serde_json::to_string(job).unwrap().as_bytes())
         .unwrap();
-    let out = child.wait_with_output().unwrap();
+    child
+}
+
+/// Run the runner binary to completion and collect its events.
+fn run_runner(job: &RunnerJob, envs: &[(&str, &str)]) -> Ran {
+    let out = spawn_runner(job, envs).wait_with_output().unwrap();
     let events = String::from_utf8(out.stdout)
         .unwrap()
         .lines()
@@ -476,4 +482,126 @@ fn a_key_without_the_three_part_shape_is_refused() {
         assert_eq!(r.last_data()["category"], "precondition", "key {bad:?}");
     }
     assert!(env.log().is_empty());
+}
+
+#[test]
+fn sigterm_while_waiting_for_the_checkpoint_lock_compensates_and_exits_143() {
+    // Another runner holds this saga's checkpoint lock, as a long apply would.
+    // The second attempt waits on it. SIGTERM (a lease expiring) must still
+    // produce the contract's needs_compensation event and exit 143.
+    let env = Env::new();
+    std::fs::create_dir_all(&env.checkpoints).unwrap();
+    let lock_file = checkpoint_path(&env.checkpoints, "saga-lock").with_extension("lock");
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_file)
+        .unwrap();
+    holder.lock().unwrap();
+
+    let checkpoints = env.checkpoints.to_string_lossy().into_owned();
+    let root = env.substrate_root.to_string_lossy().into_owned();
+    let mut child = spawn_runner(
+        &job(RunnerPhase::Apply, "job-lock"),
+        &[
+            (IDEMPOTENCY_KEY_ENV, "saga-lock:apply:1"),
+            (CHECKPOINT_DIR_ENV, &checkpoints),
+            ("PTYKTOS_AGENT_RUNNER_SUBSTRATE", "local-test"),
+            ("PTYKTOS_AGENT_RUNNER_TEST_ROOT", &root),
+            ("PTYKTOS_AGENT_RUNNER_POLL_MS", "1"),
+        ],
+    );
+
+    // Allow time to reach the lock wait. The holder keeps the lock, so the
+    // attempt cannot finish and must still be running.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the attempt should still be waiting on the lock"
+    );
+
+    let kill = Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -TERM {}", child.id()))
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let out = child.wait_with_output().unwrap();
+    drop(holder);
+
+    assert_eq!(
+        out.status.code(),
+        Some(143),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each stdout line is a RunnerEvent"))
+        .collect();
+    let last = events.last().expect("a terminal event");
+    assert_eq!(last["kind"], "needs_compensation");
+    assert!(last["data"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("checkpoint lock"));
+    assert!(env.log().is_empty(), "no substrate action may run");
+}
+
+#[test]
+fn sigterm_during_a_running_phase_compensates_and_exits_143() {
+    // apply finishes. verify then waits on a review that never decides, and
+    // SIGTERM arrives while the phase is running.
+    let env = Env::new();
+    let apply = phase(&env, "saga-run", RunnerPhase::Apply, 1, "job-run-a");
+    assert_eq!(apply.code, 0, "{:?}", apply.events);
+    env.set_flag("review", "pending:1000000");
+
+    let checkpoints = env.checkpoints.to_string_lossy().into_owned();
+    let root = env.substrate_root.to_string_lossy().into_owned();
+    let mut child = spawn_runner(
+        &job(RunnerPhase::Verify, "job-run-v"),
+        &[
+            (IDEMPOTENCY_KEY_ENV, "saga-run:verify:1"),
+            (CHECKPOINT_DIR_ENV, &checkpoints),
+            ("PTYKTOS_AGENT_RUNNER_SUBSTRATE", "local-test"),
+            ("PTYKTOS_AGENT_RUNNER_TEST_ROOT", &root),
+            // 60 checks at one per second: verify stays in progress for a minute.
+            ("PTYKTOS_AGENT_RUNNER_POLL_MS", "1000"),
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "verify should still be polling the review"
+    );
+
+    let kill = Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -TERM {}", child.id()))
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let out = child.wait_with_output().unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(143),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each stdout line is a RunnerEvent"))
+        .collect();
+    let last = events.last().expect("a terminal event");
+    assert_eq!(last["kind"], "needs_compensation");
+    assert!(last["data"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("during phase"));
 }

@@ -36,9 +36,12 @@ the canonical fixtures here.
 ## Checkpoint semantics
 
 - The checkpoint is held under an exclusive file lock from load to the end
-  of the run, so two overlapping runners on one saga serialise.
+  of the run, so two overlapping runners on one saga serialise. A runner
+  waiting for the lock polls it, so SIGTERM during that wait still ends with
+  `needs_compensation` and exit 143.
 - Every write goes to a unique temp file (`create_new`, pid, counter, clock),
-  is fsynced, then renamed over the checkpoint.
+  is fsynced, then renamed over the checkpoint. The directory is fsynced
+  after the rename, before the write reports success.
 - A phase that completed under a given full key records that key. The same
   key again replays its outcome. A different ordinal re-runs the phase
   idempotently: apply does not mount or run the agent again if it already

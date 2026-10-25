@@ -168,13 +168,39 @@ impl RunnerState {
     /// Lock and load the checkpoint at `path`. Blocks until any other holder
     /// has released the lock. A missing file is an empty state.
     pub fn open(path: &Path) -> SubstrateResult<Self> {
+        let lock = Self::lock_file(path)?;
+        lock.lock().map_err(|e| {
+            SubstrateError::Transient(format!(
+                "lock checkpoint {}: {e}",
+                path.with_extension("lock").display()
+            ))
+        })?;
+        Self::load(path, lock)
+    }
+
+    /// Like [`RunnerState::open`], but never blocks on the lock. `Ok(None)`
+    /// means another holder has it, and the caller may retry.
+    pub fn try_open(path: &Path) -> SubstrateResult<Option<Self>> {
+        let lock = Self::lock_file(path)?;
+        match lock.try_lock() {
+            Ok(()) => Self::load(path, lock).map(Some),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(SubstrateError::Transient(format!(
+                "lock checkpoint {}: {e}",
+                path.with_extension("lock").display()
+            ))),
+        }
+    }
+
+    /// The lock file beside the checkpoint, created if needed.
+    fn lock_file(path: &Path) -> SubstrateResult<File> {
         let lock_path = path.with_extension("lock");
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| {
                 SubstrateError::Transient(format!("create checkpoint dir {}: {e}", dir.display()))
             })?;
         }
-        let lock = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -182,11 +208,11 @@ impl RunnerState {
             .open(&lock_path)
             .map_err(|e| {
                 SubstrateError::Transient(format!("open lock {}: {e}", lock_path.display()))
-            })?;
-        lock.lock().map_err(|e| {
-            SubstrateError::Transient(format!("lock checkpoint {}: {e}", lock_path.display()))
-        })?;
+            })
+    }
 
+    /// Read the checkpoint under a lock that the caller already holds.
+    fn load(path: &Path, lock: File) -> SubstrateResult<Self> {
         let mut state = match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice::<RunnerState>(&bytes)
                 .map_err(|e| SubstrateError::CorruptState(format!("{}: {e}", path.display())))?,
@@ -205,8 +231,9 @@ impl RunnerState {
 
     /// Write the state to its checkpoint. The bytes go to a temp file whose
     /// name is unique to this write (`create_new`, pid + counter + clock), are
-    /// fsynced, then renamed over the checkpoint. A crash leaves the old or
-    /// the new state, never a mix. No-op for a state that was not opened.
+    /// fsynced, then renamed over the checkpoint, and the directory is fsynced
+    /// so the rename survives power loss. A crash leaves the old or the new
+    /// state, never a mix. No-op for a state that was not opened.
     pub fn persist(&self) -> SubstrateResult<()> {
         let Some(path) = &self.checkpoint else {
             return Ok(());
@@ -245,7 +272,17 @@ impl RunnerState {
         std::fs::rename(&tmp, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             io("rename", e)
-        })
+        })?;
+        // The rename is a change to the directory. Until the directory is
+        // fsynced, a power loss can bring back the old entry, so do not report
+        // success before this.
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| io("sync directory of", e))
     }
 }
 
