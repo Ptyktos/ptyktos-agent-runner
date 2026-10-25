@@ -1,130 +1,96 @@
 # ptyktos-agent-runner
 
-The Ptyktos substrate as a saga runner. Implements the
-[`hosting_core::task::RunnerJob`] / [`hosting_core::task::RunnerEvent`]
-contract for the 5 lifecycle phases
-(`plan` / `apply` / `verify` / `compensate` / `destroy`). Plugs into
-the Tasmanian-Cloud/saga `runner` crate as a 6th binary alongside
-`tofu-runner` / `ansible-runner` / `helm-runner` / `proxmox-runner` /
-`talm-runner`.
+A saga runner that drives the Ptyktos substrate through the runner
+contract: one `RunnerJob` on stdin, line-delimited `RunnerEvent`s on
+stdout, exit code from the contract table.
+
+**Status: the runner is wired, but no production substrate exists yet.**
+The binary refuses to run without a substrate (exit 2), so a default build
+cannot report a fake success. The only substrate in the crate is a local test
+double, behind the `test-substrate` cargo feature (off by default).
 
 ## The contract
 
-The runner reads one [`RunnerJob`] from stdin (JSON, schema version
-`"1"`) and emits line-delimited [`RunnerEvent`]s on stdout. Exit
-codes are the contract table:
-
 | Outcome | Exit code | Terminal kind |
 |---|---:|---|
-| `Succeeded` | 0 | `Succeeded` |
-| `Failed(Transient)` | 1 | `Failed` |
-| `Aborted(Precondition)` | 2 | `Aborted` |
-| `Aborted(Policy)` | 3 | `Aborted` |
-| `Failed(CorruptState)` | 1 | `Failed` |
-| `Failed(ProviderInternal)` | 1 | `Failed` |
-| SIGTERM | 143 | `NeedsCompensation` |
+| `Succeeded` (with `outputs`) | 0 | `succeeded` |
+| `Failed(Transient)` / `ProviderInternal` / `CorruptState` | 1 | `failed` |
+| `NeedsCompensation(Policy)`: gate denial, review rejection | 1 | `needs_compensation` |
+| `Aborted(Precondition)`: bad job, no substrate, no checkpoint key | 2 | `aborted` |
+| `Aborted(Policy)` | 3 | `aborted` |
+| unreadable job on stdin | 64 | (no event) |
+| SIGTERM during a phase | 143 | `needs_compensation` |
 
-Free-form logs go to stderr; stdout is events only.
+Logs go to stderr; stdout is events only. The wire types are a local copy
+of `hosting_core::task` (`src/contract.rs`). The copy is not checked against
+the canonical fixtures here.
 
-## The 5 phases, mapped to the Ptyktos substrate
+## Environment
 
-| Phase | Substrate touched | What the runner does |
+| Variable | Meaning |
+|---|---|
+| `TAS_RUNNER_IDEMPOTENCY_KEY` | Required. `<lifecycle>:<phase>:<ordinal>`, e.g. `saga-42:apply:1`. The lifecycle id (no `:` inside) names the checkpoint, so all phases of one saga share it. The phase segment must match the job's phase, or the runner exits 2. The full key identifies one attempt of one phase. |
+| `TAS_RUNNER_CHECKPOINT_DIR` | Required. Directory for checkpoint files: one `<hex lifecycle>.json` per saga, plus a `.lock` beside each. |
+| `PTYKTOS_AGENT_RUNNER_SUBSTRATE` | Selects a substrate. Only `local-test`, and only in a build with `--features test-substrate`. Anything else (or unset) exits 2. |
+
+## Checkpoint semantics
+
+- The checkpoint is held under an exclusive file lock from load to the end
+  of the run, so two overlapping runners on one saga serialise.
+- Every write goes to a unique temp file (`create_new`, pid, counter, clock),
+  is fsynced, then renamed over the checkpoint.
+- A phase that completed under a given full key records that key. The same
+  key again replays its outcome. A different ordinal re-runs the phase
+  idempotently: apply does not mount or run the agent again if it already
+  recorded its output.
+
+## The phases
+
+| Phase | What it does | Checkpoint |
 |---|---|---|
-| `plan` | none | Read the recipe; assemble the [`AgentTask`]; emit a `plan` event |
-| `apply` | `agentvfs` + `intent` + `memoryfold` | Mount the workspace, snapshot for rollback, invoke the agent, capture the output (PR, branch, trace ids) |
-| `verify` | `caretaker` + `telos` | Submit the PR for review, await the verdict, gate the `Done` event through `telos` |
-| `compensate` | `agentvfs` | Rollback the workspace to the pre-apply snapshot |
-| `destroy` | `agentvfs` + `memoryfold` | Tear down the workspace; seal the trace |
+| `plan` | Parses the recipe; no side effects. | none |
+| `apply` | Mounts the workspace once, snapshots it, runs the agent, records the output. A retry with the same key returns the recorded output without mounting or running again. | workspace, snapshot, agent output |
+| `verify` | Submits the branch once, polls the review until it decides (pending is polled again), then consults the gate. A rejection or a denial is `needs_compensation`. | review id |
+| `compensate` | Restores the pre-apply snapshot. | reads apply's |
+| `destroy` | Removes the workspace. | reads apply's |
 
-## The recipe shape
+Successful terminal events carry `outputs`: for `apply` the agent output
+(branch, PR, trace ids), for `verify` the review id.
 
-The runner expects the rendered template to be a JSON object with the
-`agent` section:
+## Recipe shape
+
+The rendered template must be an object with an `agent` section:
 
 ```json
-{
-  "agent": {
-    "repo": "ptyktos/memoryfold",
-    "branch": "feat/trace-ontology-v2",
-    "base_sha": "abc123",
-    "task": "the natural-language task description"
-  }
-}
+{ "agent": { "repo": "ptyktos/memoryfold", "branch": "feat/x", "base_sha": "abc123", "task": "..." } }
 ```
 
-If the rendered template doesn't match this shape, the runner aborts
-with a `Precondition` failure and the saga-orchestrator branches on
-it.
+Anything else is a `precondition` failure.
 
-## How to plug it into the saga
-
-1. Add `ptyktos-agent-runner = { path = "../ptyktos-agent-runner" }` to
-   the saga `runner` crate's `Cargo.toml`.
-2. Add a new binary:
-
-   ```rust
-   // crates/runner/src/bin/ptyktos_agent_runner.rs
-   fn main() -> std::process::ExitCode {
-       let Some(job) = runner::read_job_from_stdin() else {
-           return std::process::ExitCode::from(64);
-       };
-       let emitter = runner::EventEmitter::new(&job);
-       let substrate = ptyktos_agent_runner::PtyktosSubstrate::ptyktos();
-       let mut state = ptyktos_agent_runner::RunnerState::default();
-       match runner::race_sigterm(ptyktos_agent_runner::run(&job, &substrate, &mut state)).await {
-           runner::RaceOutcome::Completed(outcome) => runner::finish(&emitter, outcome),
-           runner::RaceOutcome::SigTerm => runner::handle_sigterm(&job),
-       }
-   }
-   ```
-
-3. Register the new runner in the saga-planner's
-   `RunnerKind::parse` so a recipe's `kind: ptyktos-agent` dispatches
-   to this binary.
-
-4. Author the `ptyktos-agent-deploy` recipe type in
-   `recipe-composer` (alongside `tofu-deploy`, `ansible-deploy`,
-   `helm-deploy`, `proxmox-deploy`, `talos-deploy`). The recipe's
-   `template` is the agent-task JSON above; the `requires` are the
-   substrate crates the agent needs mounted into its workspace
-   (typically `memoryfold` for the trace context, `caretaker` for the
-   review target, `telos` for the gate's policy file).
-
-5. The saga-orchestrator handles the rest — phases, retries, lease
-   boundaries, audit — exactly the same as for the existing runners.
-
-## Build
+## Build and test
 
 ```sh
-# minimal (no substrate — uses the no-op adapters; the lib still builds)
-cargo build --no-default-features --features minimal
-
-# full (with the Ptyktos substrate — `ptyktos-coding-agent` and friends
-# path-deps in the dev layout)
-cargo build --features substrate
-
-# test
-cargo test
+cargo build                       # production shape: no substrate, exits 2
+cargo test                        # dev-dependency turns on test-substrate
+cargo clippy --all-targets -- -D warnings
+cargo deny check
 ```
 
-## Why a new runner and not a new saga?
+The process tests (`tests/process.rs`) start the real binary, run apply and
+verify as separate processes sharing one checkpoint directory, and check:
+denial yields compensation, a retried apply does not mount a second
+workspace (including after a failure between mount and snapshot), a pending
+review is polled, a missing substrate exits 2, and a corrupt checkpoint is
+`corrupt_state`.
 
-The agent's work is a *single step* in a larger deploy flow. The
-saga-orchestrator owns the multi-step flow (plan → apply → verify
-→ compensate/destroy). The runner is the workhorse. Trying to model
-agent work as its own saga would re-implement the runner contract
-without a reason.
+## Not done
 
-## Cross-references
-
-- The runner contract: `hosting_core::task::{RunnerJob, RunnerEvent,
-  RunnerOutcome, RunnerPhase, FailureCategory}`. The contract
-  schema lives in `runtime/hosting-runtime/crates/runner-contract-tests/`.
-- The saga-orchestrator: `Tasmanian-Cloud/saga` repo, the
-  `saga-orchestrator` crate. The runner binaries are siblings in
-  the `runner` crate.
-- The Ptyktos substrate: `Ptyktos/{ptyktos-coding-agent, memoryfold,
-  intent, caretaker, conduit, telos, workfold, hashtrinity,
-  modelfold, sangdb, agentvfs}` on GitHub.
-- The factory this runner plugs into:
-  `runtime/hosting-runtime` (workflow + reconciliation services).
+- No production adapters for `agentvfs`, `intent`, `memoryfold`,
+  `caretaker`, or `telos`. Their APIs were not available to verify. They
+  belong in a composition root outside this crate.
+- The wire types are not checked for byte-equality against
+  `runtime/hosting-runtime/crates/runner-contract-tests`, which is not in
+  this repository.
+- A crash between mounting a workspace and writing its checkpoint can still
+  leave an orphan workspace. The checkpoint is written right after the mount,
+  but nothing reconciles a workspace that was never recorded.
